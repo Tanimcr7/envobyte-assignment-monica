@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\ImportJob;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Storage;
 
 class ImportController extends Controller
@@ -17,7 +18,7 @@ class ImportController extends Controller
             ->paginate((int) $request->input('per_page', 10));
 
         $data = $imports->map(function ($job) {
-            $progressPct = $job->total_rows > 0 ? round(($job->processed_rows / $job->total_rows) * 100) : 0;
+            $progressPct = $this->progressPct($job);
             return [
                 'id' => $job->id,
                 'filename' => $job->filename,
@@ -26,9 +27,9 @@ class ImportController extends Controller
                 'failed_rows' => $job->failed_rows,
                 'status' => $job->status,
                 'progress_pct' => $progressPct,
-                'created_at' => $job->created_at->toIso8601String(),
+                'created_at' => $this->timestamp($job->created_at),
             ];
-        });
+        })->values();
 
         return response()->json([
             'data' => $data,
@@ -44,11 +45,20 @@ class ImportController extends Controller
     public function store(Request $request): JsonResponse
     {
         $request->validate([
-            'file' => 'required|file|mimes:csv,txt|max:10240',
+            'file' => 'required|file|mimes:csv,txt,vcf|max:10240',
+            'vault_id' => 'sometimes|nullable|string',
         ]);
 
+        $user = auth()->user();
+        $vault = $this->resolveVault($request);
+        if (!$vault) {
+            return response()->json([
+                'message' => 'No accessible vault found for this import.',
+            ], 422);
+        }
+
         $file = $request->file('file');
-        $fileHash = md5_file($file->getRealPath());
+        $fileHash = hash_file('sha256', $file->getRealPath());
         
         $existingJob = ImportJob::where('user_id', auth()->id())
             ->where('file_hash', $fileHash)
@@ -64,20 +74,17 @@ class ImportController extends Controller
 
         $path = $file->storeAs('imports', $fileHash . '_' . $file->getClientOriginalName(), 'local');
 
-        $lineCount = 0;
-        $handle = fopen($file->getRealPath(), 'r');
-        while (!feof($handle)) {
-            $buffer = fread($handle, 8192);
-            $lineCount += substr_count($buffer, "\n");
-        }
-        fclose($handle);
-
-        $totalRows = max(0, $lineCount - 1);
+        $format = $this->detectFormat($file->getClientOriginalName());
+        $totalRows = $format === 'vcard'
+            ? $this->countVcards($file->getRealPath())
+            : $this->countCsvRows($file->getRealPath());
 
         $importJob = ImportJob::create([
-            'account_id' => auth()->user()->account_id,
-            'user_id' => auth()->id(),
+            'account_id' => $user->account_id,
+            'user_id' => $user->id,
+            'vault_id' => $vault->id,
             'filename' => $file->getClientOriginalName(),
+            'format' => $format,
             'file_path' => $path,
             'file_hash' => $fileHash,
             'total_rows' => $totalRows,
@@ -85,7 +92,6 @@ class ImportController extends Controller
             'created_at' => now(),
         ]);
 
-        // Dispatch background job (we will create this job class next)
         \App\Domains\Contact\ManageImport\Jobs\StartImportJob::dispatch($importJob->id);
 
         return response()->json([
@@ -96,7 +102,7 @@ class ImportController extends Controller
                 'processed_rows' => $importJob->processed_rows,
                 'failed_rows' => $importJob->failed_rows,
                 'status' => $importJob->status,
-                'created_at' => $importJob->created_at->toIso8601String(),
+                'created_at' => $this->timestamp($importJob->created_at),
             ]
         ], 201);
     }
@@ -104,13 +110,13 @@ class ImportController extends Controller
     public function show(int $id): JsonResponse
     {
         $job = ImportJob::where('user_id', auth()->id())->findOrFail($id);
-        $progressPct = $job->total_rows > 0 ? round(($job->processed_rows / $job->total_rows) * 100) : 0;
+        $progressPct = $this->progressPct($job);
         
         $estimated_remaining_sec = null;
         if ($job->status === 'processing' && $job->started_at && $job->processed_rows > 0) {
             $elapsed = now()->diffInSeconds($job->started_at);
             $rate = $job->processed_rows / max($elapsed, 1);
-            $remaining_rows = $job->total_rows - $job->processed_rows;
+            $remaining_rows = max(0, $job->total_rows - $job->processed_rows);
             $estimated_remaining_sec = round($remaining_rows / max($rate, 0.01));
         }
 
@@ -124,7 +130,7 @@ class ImportController extends Controller
                 'status' => $job->status,
                 'progress_pct' => $progressPct,
                 'errors' => $job->errors ?? [],
-                'started_at' => $job->started_at ? $job->started_at->toIso8601String() : null,
+                'started_at' => $job->started_at ? $this->timestamp($job->started_at) : null,
                 'estimated_remaining_sec' => $estimated_remaining_sec,
             ]
         ]);
@@ -136,6 +142,10 @@ class ImportController extends Controller
         
         if (in_array($job->status, ['pending', 'processing'])) {
             $job->update(['status' => 'cancelled']);
+
+            if ($job->batch_id) {
+                Bus::findBatch($job->batch_id)?->cancel();
+            }
         }
 
         return response()->json([
@@ -148,8 +158,8 @@ class ImportController extends Controller
         $job = ImportJob::where('user_id', auth()->id())->findOrFail($id);
         
         $errors = $job->errors ?? [];
-        $page = request()->input('page', 1);
-        $perPage = request()->input('per_page', 10);
+        $page = max(1, (int) request()->input('page', 1));
+        $perPage = min(100, max(1, (int) request()->input('per_page', 10)));
         $offset = ($page - 1) * $perPage;
         
         $paginatedErrors = array_slice($errors, $offset, $perPage);
@@ -171,16 +181,20 @@ class ImportController extends Controller
         if (empty($job->errors)) {
             abort(404, 'No errors found');
         }
+        if ($job->format !== 'csv') {
+            abort(404, 'Error CSV is available only for CSV imports');
+        }
 
         $errorMap = [];
         foreach ($job->errors as $err) {
             $errorMap[$err['row']] = $err['message'];
         }
 
-        $filePath = storage_path('app/' . $job->file_path);
-        if (!file_exists($filePath)) {
+        if (!Storage::disk('local')->exists($job->file_path)) {
             abort(404, 'Original file not found');
         }
+
+        $filePath = Storage::disk('local')->path($job->file_path);
 
         $callback = function () use ($filePath, $errorMap) {
             $file = fopen($filePath, 'r');
@@ -205,11 +219,86 @@ class ImportController extends Controller
         };
 
         return response()->stream($callback, 200, [
-            "Content-type"        => "text/csv",
+            "Content-Type"        => "text/csv; charset=UTF-8",
             "Content-Disposition" => "attachment; filename={$job->filename}_errors.csv",
             "Pragma"              => "no-cache",
             "Cache-Control"       => "must-revalidate, post-check=0, pre-check=0",
             "Expires"             => "0"
         ]);
+    }
+
+    private function resolveVault(Request $request)
+    {
+        $user = auth()->user();
+        $query = $user->vaults()->where('vaults.account_id', $user->account_id);
+
+        if ($request->filled('vault_id')) {
+            return $query->whereKey($request->input('vault_id'))->first();
+        }
+
+        return $query->orderBy('vaults.created_at')->first();
+    }
+
+    private function countCsvRows(string $path): int
+    {
+        $file = fopen($path, 'r');
+        if (!$file) {
+            return 0;
+        }
+
+        $header = fgetcsv($file);
+        if (!$header) {
+            fclose($file);
+            return 0;
+        }
+
+        $rows = 0;
+        while (fgetcsv($file) !== false) {
+            $rows++;
+        }
+
+        fclose($file);
+
+        return $rows;
+    }
+
+    private function countVcards(string $path): int
+    {
+        $file = fopen($path, 'r');
+        if (!$file) {
+            return 0;
+        }
+
+        $cards = 0;
+        while (($line = fgets($file)) !== false) {
+            if (strtoupper(trim($line)) === 'END:VCARD') {
+                $cards++;
+            }
+        }
+
+        fclose($file);
+
+        return $cards;
+    }
+
+    private function detectFormat(string $filename): string
+    {
+        $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+
+        return $extension === 'vcf' ? 'vcard' : 'csv';
+    }
+
+    private function progressPct(ImportJob $job): int
+    {
+        if ($job->total_rows <= 0) {
+            return 0;
+        }
+
+        return min(100, (int) round(($job->processed_rows / $job->total_rows) * 100));
+    }
+
+    private function timestamp($date): string
+    {
+        return $date->copy()->utc()->format('Y-m-d\TH:i:s\Z');
     }
 }

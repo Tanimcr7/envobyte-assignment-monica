@@ -10,7 +10,9 @@ use Illuminate\Support\Facades\Storage;
 use Tests\TestCase;
 use App\Models\User;
 use App\Models\Account;
+use App\Models\Contact;
 use App\Models\ImportJob;
+use App\Models\Vault;
 use App\Domains\Contact\ManageImport\Jobs\StartImportJob;
 use App\Domains\Contact\ManageImport\Jobs\ProcessImportChunkJob;
 
@@ -24,6 +26,17 @@ class ImportTest extends TestCase
         // Assume Monica's testing structure creates an account and user
         $this->account = Account::factory()->create();
         $this->user = User::factory()->create(['account_id' => $this->account->id]);
+        $this->vault = Vault::factory()->create(['account_id' => $this->account->id]);
+        $contact = Contact::create([
+            'vault_id' => $this->vault->id,
+            'first_name' => $this->user->first_name,
+            'last_name' => $this->user->last_name,
+            'can_be_deleted' => false,
+        ]);
+        $this->vault->users()->attach($this->user->id, [
+            'permission' => Vault::PERMISSION_MANAGE,
+            'contact_id' => $contact->id,
+        ]);
         $this->actingAs($this->user);
     }
 
@@ -66,8 +79,10 @@ class ImportTest extends TestCase
         $job = ImportJob::create([
             'account_id' => $this->account->id,
             'user_id' => $this->user->id,
+            'vault_id' => $this->vault->id,
             'filename' => 'test.csv',
             'file_path' => 'dummy',
+            'total_rows' => 2,
             'status' => 'processing',
         ]);
 
@@ -82,10 +97,40 @@ class ImportTest extends TestCase
 
         $job->refresh();
 
-        $this->assertEquals(1, $job->processed_rows);
+        $this->assertEquals(2, $job->processed_rows);
         $this->assertEquals(1, $job->failed_rows);
         $this->assertCount(1, $job->errors);
         $this->assertEquals(3, $job->errors[0]['row']);
+    }
+
+    public function test_vcard_batch_processing()
+    {
+        $job = ImportJob::create([
+            'account_id' => $this->account->id,
+            'user_id' => $this->user->id,
+            'vault_id' => $this->vault->id,
+            'filename' => 'contacts.vcf',
+            'format' => 'vcard',
+            'file_path' => 'dummy',
+            'total_rows' => 1,
+            'status' => 'processing',
+        ]);
+
+        $chunk = [
+            [
+                'rowNum' => 1,
+                'type' => 'vcard',
+                'data' => "BEGIN:VCARD\nVERSION:3.0\nFN:Jane Doe\nEND:VCARD\n",
+            ],
+        ];
+
+        $processJob = new ProcessImportChunkJob($job->id, $chunk);
+        $processJob->handle();
+
+        $job->refresh();
+
+        $this->assertEquals(1, $job->processed_rows);
+        $this->assertEquals(0, $job->failed_rows);
     }
 
     public function test_import_cancellation()
@@ -93,6 +138,7 @@ class ImportTest extends TestCase
         $job = ImportJob::create([
             'account_id' => $this->account->id,
             'user_id' => $this->user->id,
+            'vault_id' => $this->vault->id,
             'filename' => 'test.csv',
             'file_path' => 'dummy',
             'status' => 'processing',
@@ -104,6 +150,41 @@ class ImportTest extends TestCase
         $this->assertEquals('cancelled', $job->refresh()->status);
     }
 
+    public function test_import_list_and_paginated_errors()
+    {
+        $job = ImportJob::create([
+            'account_id' => $this->account->id,
+            'user_id' => $this->user->id,
+            'vault_id' => $this->vault->id,
+            'filename' => 'contacts.csv',
+            'file_path' => 'dummy',
+            'total_rows' => 2,
+            'processed_rows' => 2,
+            'failed_rows' => 2,
+            'status' => 'completed',
+            'errors' => [
+                ['row' => 2, 'message' => "Invalid email: 'bad'"],
+                ['row' => 3, 'message' => 'Missing required field: name'],
+            ],
+        ]);
+
+        $this->getJson('/api/import?page=1&per_page=10')
+            ->assertStatus(200)
+            ->assertJsonPath('data.0.id', $job->id)
+            ->assertJsonPath('data.0.progress_pct', 100)
+            ->assertJsonPath('meta.current_page', 1)
+            ->assertJsonPath('meta.per_page', 10)
+            ->assertJsonPath('meta.total', 1);
+
+        $this->getJson("/api/import/{$job->id}/errors?page=1&per_page=1")
+            ->assertStatus(200)
+            ->assertJsonPath('data.0.row', 2)
+            ->assertJsonPath('meta.current_page', 1)
+            ->assertJsonPath('meta.per_page', 1)
+            ->assertJsonPath('meta.total', 2)
+            ->assertJsonPath('meta.last_page', 2);
+    }
+
     public function test_error_csv_generation()
     {
         Storage::fake('local');
@@ -113,6 +194,7 @@ class ImportTest extends TestCase
         $job = ImportJob::create([
             'account_id' => $this->account->id,
             'user_id' => $this->user->id,
+            'vault_id' => $this->vault->id,
             'filename' => 'contacts.csv',
             'file_path' => $filePath,
             'status' => 'completed',

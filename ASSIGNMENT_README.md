@@ -6,7 +6,7 @@ This branch (`envobyte-assignment`) introduces a reliable, asynchronous, and sca
 ## Architecture & Implementation
 - **Queue Engine:** Redis, utilizing Laravel's built-in `Bus::batch()` capabilities to chunk large files into manageable batch jobs.
 - **Data Persistence:** An `import_jobs` table tracks status, metrics (processed/failed rows), and serialized per-row errors.
-- **Idempotency:** The system calculates an MD5 hash of uploaded files to prevent identical, duplicate uploads.
+- **Idempotency:** The system calculates a SHA-256 hash of uploaded files to prevent identical, duplicate uploads.
 - **Observability:** Added a console command `imports:check-stuck` to detect crashed/frozen imports and trigger team alerts for high failure rates.
 
 ## How to Set Up

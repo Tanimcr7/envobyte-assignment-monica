@@ -1,7 +1,7 @@
 # Monica CRM: Reliable Background Import System
 
 ## Overview
-This repository contains my submission for the Senior Backend Developer assignment. I have designed and implemented a reliable, asynchronous background import system for Monica CRM. It completely replaces synchronous CSV imports with a robust, queue-driven pipeline that supports real-time progress tracking, per-row error isolation, concurrency controls, and failure alerting.
+This repository contains my solution for the Senior Backend Developer assignment. I have designed and implemented a reliable, asynchronous background import system for Monica CRM. It completely replaces synchronous CSV imports with a robust, queue-driven pipeline that supports real-time progress tracking, per-row error isolation, concurrency controls, and failure alerting.
 
 ---
 

@@ -3,6 +3,9 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use App\Models\Account;
+use App\Models\User;
+use App\Models\Vault;
 
 return new class extends Migration
 {
@@ -13,12 +16,15 @@ return new class extends Migration
     {
         Schema::create('import_jobs', function (Blueprint $table) {
             $table->id();
-            $table->unsignedBigInteger('account_id');
-            $table->unsignedBigInteger('user_id');
+            $table->foreignIdFor(Account::class)->constrained()->cascadeOnDelete();
+            $table->foreignIdFor(User::class)->constrained()->cascadeOnDelete();
+            $table->foreignIdFor(Vault::class)->constrained()->cascadeOnDelete();
             
             $table->string('filename');
+            $table->string('format')->default('csv');
             $table->string('file_path')->nullable();
             $table->string('file_hash')->nullable();
+            $table->string('batch_id')->nullable();
             
             $table->integer('total_rows')->default(0);
             $table->integer('processed_rows')->default(0);
@@ -31,8 +37,9 @@ return new class extends Migration
             $table->timestamp('completed_at')->nullable();
             $table->timestamps();
 
-            $table->foreign('account_id')->references('id')->on('accounts')->onDelete('cascade');
-            $table->foreign('user_id')->references('id')->on('users')->onDelete('cascade');
+            $table->index(['user_id', 'created_at']);
+            $table->index(['user_id', 'file_hash']);
+            $table->index(['status', 'updated_at']);
         });
     }
 

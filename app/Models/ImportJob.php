@@ -15,9 +15,12 @@ class ImportJob extends Model
     protected $fillable = [
         'account_id',
         'user_id',
+        'vault_id',
         'filename',
+        'format',
         'file_path',
         'file_hash',
+        'batch_id',
         'total_rows',
         'processed_rows',
         'failed_rows',
@@ -44,6 +47,11 @@ class ImportJob extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function vault(): BelongsTo
+    {
+        return $this->belongsTo(Vault::class);
     }
 
     public function wasCancelled(): bool
